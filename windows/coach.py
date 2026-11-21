@@ -5,6 +5,9 @@ transcript to Claude, and shows ready-to-send replies as copy buttons.
 
     python coach.py                  # the panel (Ctrl+Alt+G brings it back)
     python coach.py --source-check   # counts and timings only, no chat content
+    python coach.py --set-key HEX    # check a WeChat database key against this computer's accounts and save it
+    python coach.py --key-provider TOOL.exe   # run an external key tool (WeFlow protocol), save its key
+    python coach.py --engine auto|api|claude|codex
     python coach.py --smoke          # opens the panel and closes it after 4 s (CI)
 """
 
@@ -25,10 +28,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import scrolledtext, simpledialog, ttk
+from tkinter import filedialog, scrolledtext, simpledialog, ttk
 
 import transcript as tr
-from wechat_db import Session, WeChatDB, WeChatDBError
+from wechat_db import NeedKey, Session, WeChatDB, WeChatDBError, account_id, find_storages, run_key_provider
 
 IS_WIN = sys.platform == "win32"
 MODEL = "claude-opus-5-5"
@@ -120,6 +123,27 @@ class KeyStore:
         import keyring
 
         keyring.set_password(cls.service, cls.user, key)
+
+
+class WeChatKeyStore:
+    """WeChat database keys the user saved, per account folder (Windows Credential Manager / Keychain)."""
+
+    service = "WeChatCoach.wechat"
+
+    @classmethod
+    def load(cls, account: str) -> str | None:
+        try:
+            import keyring
+
+            return keyring.get_password(cls.service, account)
+        except Exception:
+            return None
+
+    @classmethod
+    def save(cls, account: str, hexkey: str) -> None:
+        import keyring
+
+        keyring.set_password(cls.service, account, hexkey)
 
 
 # ---------------------------------------------------------------- system prompt
@@ -482,7 +506,7 @@ CHIPS = {
 class Coach:
     def __init__(self) -> None:
         self.settings = Settings()
-        self.db = WeChatDB()
+        self.db = make_db(self.settings)
         self.db_ready = False
         self.system_prompt = load_system_prompt()
         self.running = False
@@ -538,6 +562,7 @@ class Coach:
         self.contact.bind("<<ComboboxSelected>>", lambda e: self.contact_changed())
         self.contact.pack(side="left", fill="x", expand=True)
         ttk.Button(row, text="↻", width=3, command=lambda: self.bg(self.refresh_sessions)).pack(side="left", padx=4)
+        ttk.Button(row, text="密钥", width=5, command=self.key_dialog).pack(side="left")
         self.source = ttk.Label(row, text="", foreground="gray")
         self.source.pack(side="left")
 
@@ -650,7 +675,7 @@ class Coach:
                 self.contact.configure(values=["（读不了本地聊天记录，用截图）"])
                 self.contact.current(0)
                 self.load_note()
-                self.set_status(msg + " 现在先用截图模式。")
+                self.set_status(msg + " 现在先用截图模式：点「分析」会截取微信窗口，只看当前一屏。")
 
             self.on_ui(screenshot_mode)
             return
@@ -670,6 +695,94 @@ class Coach:
                 self.set_status(f"当前：{self.selected.display_name}，点「分析」开始（默认是最近聊天的人）")
 
         self.on_ui(apply)
+
+    def key_dialog(self) -> None:
+        """Let the user point the app at a key: paste it, or run an external key tool."""
+        win = tk.Toplevel(self.root)
+        win.title("微信数据库密钥")
+        win.attributes("-topmost", True)
+        win.transient(self.root)
+        f = ttk.Frame(win, padding=12)
+        f.pack(fill="both", expand=True)
+        storages = find_storages(self.db.extra_roots)
+        ttk.Label(f, text="微信数据目录：" + (str(storages[0]) if storages else "没找到（可以手动选）"),
+                  wraplength=420).pack(anchor="w")
+
+        def pick_dir():
+            d = filedialog.askdirectory(parent=win, title="选择 xwechat_files 文件夹（或其中某个账号文件夹）")
+            if d:
+                dirs = self.settings.data.setdefault("wechatDirs", [])
+                if d not in dirs:
+                    dirs.append(d)
+                self.settings.save()
+                self.db.extra_roots = [Path(p) for p in dirs]
+                win.destroy()
+                self.key_dialog()
+
+        ttk.Button(f, text="选择数据目录…", command=pick_dir).pack(anchor="w", pady=(4, 10))
+
+        ttk.Label(f, text="方式一：粘贴密钥（64 位十六进制，用任何取密钥工具得到的都行）").pack(anchor="w")
+        key_entry = ttk.Entry(f, width=70, show="•")
+        key_entry.pack(fill="x", pady=(2, 4))
+        result = ttk.Label(f, text="", foreground="gray", wraplength=420)
+
+        def done(acct, hexkey):
+            WeChatKeyStore.save(account_id(acct.storage), hexkey)
+            result.configure(text="密钥可用，已保存。", foreground="green")
+            self.bg(self.refresh_sessions)
+            win.after(800, win.destroy)
+
+        def use_pasted():
+            hexkey = key_entry.get().strip()
+            try:
+                acct = self.db.use_key(hexkey)
+            except WeChatDBError as e:
+                result.configure(text=str(e), foreground="red")
+                return
+            done(acct, hexkey)
+
+        ttk.Button(f, text="检查并保存", command=use_pasted).pack(anchor="w")
+
+        ttk.Label(f, text="\n方式二：外部取密钥工具（和 WeFlow 的「外部密钥工具」用同一种格式）").pack(anchor="w")
+        provider = tk.StringVar(value=self.settings.data.get("keyProvider", ""))
+        prow = ttk.Frame(f)
+        prow.pack(fill="x", pady=(2, 4))
+        ttk.Entry(prow, textvariable=provider).pack(side="left", fill="x", expand=True)
+
+        def browse():
+            p = filedialog.askopenfilename(parent=win, title="选择取密钥工具",
+                                           filetypes=[("程序", "*.exe"), ("所有文件", "*.*")])
+            if p:
+                provider.set(p)
+
+        ttk.Button(prow, text="浏览…", command=browse).pack(side="left", padx=(6, 0))
+
+        def run_tool():
+            exe = provider.get().strip()
+            if not exe or not os.path.exists(exe):
+                result.configure(text="先选择取密钥工具。", foreground="red")
+                return
+            if not storages:
+                result.configure(text="先选择微信数据目录。", foreground="red")
+                return
+            self.settings.data["keyProvider"] = exe
+            self.settings.save()
+            result.configure(text="正在运行取密钥工具（微信需要开着并已登录）…", foreground="gray")
+
+            def work():
+                try:
+                    hexkey = run_key_provider(exe, storages[0])
+                    acct = self.db.use_key(hexkey, storages[0])
+                    self.on_ui(done, acct, hexkey)
+                except WeChatDBError as e:
+                    self.on_ui(lambda: result.configure(text=str(e), foreground="red"))
+
+            self.bg(work)
+
+        ttk.Button(f, text="运行工具取密钥", command=run_tool).pack(anchor="w")
+        result.pack(anchor="w", pady=(10, 0))
+        ttk.Label(f, text="密钥只保存在本机（Windows 凭据管理器），不会发给任何人。没有密钥也能用截图模式。",
+                  foreground="gray", wraplength=420).pack(anchor="w", pady=(10, 0))
 
     def load_note(self) -> None:
         self.set_value(self.note, self.settings.note(self.note_key))
@@ -977,9 +1090,54 @@ class Coach:
                     c.close()
 
 
+def make_db(settings: Settings) -> WeChatDB:
+    roots = [Path(p) for p in settings.data.get("wechatDirs", [])]
+    return WeChatDB(saved_key=WeChatKeyStore.load, extra_roots=roots)
+
+
+def cli_set_key(hexkey: str) -> int:
+    db = make_db(Settings())
+    try:
+        acct = db.use_key(hexkey)
+    except WeChatDBError as e:
+        print(f"[key] {e}")
+        return 1
+    WeChatKeyStore.save(account_id(acct.storage), hexkey.strip())
+    print(f"[key] ok, saved for account {account_id(acct.storage)[:8]}… ({len(db.sessions())} private chats)")
+    return 0
+
+
+def cli_key_provider(exe: str) -> int:
+    settings = Settings()
+    db = make_db(settings)
+    storages = find_storages(db.extra_roots)
+    if not storages:
+        print("[key] 没找到微信数据目录（xwechat_files）")
+        return 1
+    try:
+        hexkey = run_key_provider(exe, storages[0])
+    except WeChatDBError as e:
+        print(f"[key] {e}")
+        return 1
+    settings.data["keyProvider"] = exe
+    settings.save()
+    return cli_set_key(hexkey)
+
+
+def cli_engine(engine: str) -> int:
+    if engine not in ENGINES:
+        print(f"[engine] 可选：{', '.join(ENGINES)}")
+        return 1
+    settings = Settings()
+    settings.data["engine"] = engine
+    settings.save()
+    print(f"[engine] {engine}")
+    return 0
+
+
 def source_check() -> int:
     """Counts and timings only, no chat content."""
-    db = WeChatDB()
+    db = make_db(Settings())
     try:
         t = time.time()
         acct = db.account()
@@ -996,6 +1154,9 @@ def source_check() -> int:
             print(f"[source] transcript: {len(lines)} lines, xml-leak lines="
                   f"{sum(('<' in l or 'CDATA' in l) for l in lines)}")
         return 0
+    except NeedKey as e:
+        print(f"[source] NEED_KEY {e}")
+        return 2
     except WeChatDBError as e:
         print(f"[source] {e}")
         return 1
@@ -1014,6 +1175,12 @@ if __name__ == "__main__":
             stream.reconfigure(errors="replace")
     if len(sys.argv) >= 2 and sys.argv[1] == "--source-check":
         sys.exit(source_check())
+    if len(sys.argv) >= 3 and sys.argv[1] == "--set-key":
+        sys.exit(cli_set_key(sys.argv[2]))
+    if len(sys.argv) >= 3 and sys.argv[1] == "--key-provider":
+        sys.exit(cli_key_provider(sys.argv[2]))
+    if len(sys.argv) >= 3 and sys.argv[1] == "--engine":
+        sys.exit(cli_engine(sys.argv[2]))
     app = Coach()
     if "--smoke" in sys.argv:  # CI: open the panel, then close it after a few seconds
         app.root.after(4000, app.root.destroy)

@@ -68,3 +68,33 @@ def test_page_crypto_roundtrip():
     assert wechat_db._verify_page(page, 1, mk)
     out = wechat_db._decrypt_page(page, 1, key)
     assert out.startswith(wechat_db.SQLITE_HEADER) and out[16:16 + len(plain)] == plain
+
+
+def test_find_storage_and_check_key(tmp_path):
+    """A fake xwechat_files/<account>/db_storage whose session.db page 1 is encrypted with a known key."""
+    import hashlib
+    import hmac
+    import struct
+
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    key, salt, iv = os.urandom(32), os.urandom(16), os.urandom(16)
+    e = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
+    body = salt + e.update(os.urandom(wechat_db.PAGE_SIZE - 16 - wechat_db.RESERVE)) + e.finalize() + iv
+    page = body + hmac.new(wechat_db._mac_key(key, salt), body[16:] + struct.pack("<I", 1), hashlib.sha512).digest()
+    st = tmp_path / "xwechat_files" / "wxid_test_ab12" / "db_storage"
+    (st / "session").mkdir(parents=True)
+    (st / "session" / "session.db").write_bytes(page)
+
+    found = wechat_db.find_storages([tmp_path / "xwechat_files"])
+    assert st in found
+    assert wechat_db.check_key(st, key) is False
+    assert wechat_db.check_key(st, os.urandom(32)) is None
+    db = wechat_db.WeChatDB(saved_key=lambda a: None, extra_roots=[tmp_path / "xwechat_files"])
+    db._from_weflow = lambda: (_ for _ in ()).throw(wechat_db.WeChatDBError("no weflow"))
+    try:
+        db.account()
+        raise AssertionError("expected NeedKey")
+    except wechat_db.NeedKey:
+        pass
+    assert db.use_key(key.hex()).storage == st

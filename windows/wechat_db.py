@@ -1,8 +1,10 @@
 """Read-only access to the user's own WeChat 4.x databases (Windows; macOS works too for testing).
 
-Uses the database key that WeFlow already captured (stored in WeFlow's config and protected by
-Electron safeStorage). Databases are decrypted in memory only; nothing is written to disk and
-nothing is ever written back to WeChat. Port of mac/Sources/WeChatDB.swift.
+The 32-byte database key comes from, in order:
+  1. a key WeFlow captured earlier (WeFlow's config, protected by Electron safeStorage);
+  2. a key the user saved in this app (pasted, or returned by an external key tool);
+This module never reads WeChat's process memory. Databases are decrypted in memory only; nothing is
+written to disk and nothing is ever written back to WeChat. Port of mac/Sources/WeChatDB.swift.
 """
 
 from __future__ import annotations
@@ -32,6 +34,10 @@ SQLITE_HEADER = b"SQLite format 3\x00"
 
 class WeChatDBError(Exception):
     pass
+
+
+class NeedKey(WeChatDBError):
+    """WeChat data was found, but no working key is available yet."""
 
 
 @dataclass
@@ -152,6 +158,90 @@ def normalize_wxid(s: str) -> str:
     return s[: m.start()] if m else s
 
 
+def candidate_roots(extra: list[Path] | None = None) -> list[Path]:
+    """Folders that may hold xwechat_files/<account>/db_storage (WeChat 4.x defaults first)."""
+    home = Path.home()
+    roots = list(extra or [])
+    if sys.platform == "win32":
+        profile = Path(os.environ.get("USERPROFILE", home))
+        roots += [profile / "Documents" / "xwechat_files", home / "Documents" / "xwechat_files"]
+    elif sys.platform == "darwin":
+        roots += [home / "Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files"]
+    return roots
+
+
+def find_storages(extra: list[Path] | None = None) -> list[Path]:
+    """db_storage folders of the WeChat accounts on this computer, most recently used first."""
+    found: dict[Path, float] = {}
+    for root in candidate_roots(extra):
+        # Accept the xwechat_files root, an account folder, or db_storage itself.
+        for cand in (root, root / "db_storage"):
+            if (cand / "session" / "session.db").exists():
+                found[cand] = (cand / "session" / "session.db").stat().st_mtime
+        try:
+            children = list(root.iterdir()) if root.is_dir() else []
+        except OSError:
+            children = []
+        for d in children:
+            st = d / "db_storage"
+            db = st / "session" / "session.db"
+            if db.exists():
+                found[st] = db.stat().st_mtime
+    return sorted(found, key=lambda p: found[p], reverse=True)
+
+
+def account_id(storage: Path) -> str:
+    return storage.parent.name
+
+
+def check_key(storage: Path, raw: bytes) -> bool | None:
+    """None if `raw` doesn't open this account's databases; else whether it must be PBKDF2-derived."""
+    if len(raw) != 32:
+        return None
+    with open(storage / "session" / "session.db", "rb") as f:
+        page1 = f.read(PAGE_SIZE)
+    salt = page1[:16]
+    if _verify_page(page1, 1, _mac_key(raw, salt)):
+        return False
+    if _verify_page(page1, 1, _mac_key(_pbkdf2_sha512(raw, salt, 256_000), salt)):
+        return True
+    return None
+
+
+def parse_hex_key(s: str) -> bytes:
+    s = re.sub(r"[\s'\"]", "", s or "")
+    if s.lower().startswith("0x"):
+        s = s[2:]
+    try:
+        return bytes.fromhex(s)
+    except ValueError:
+        return b""
+
+
+def run_key_provider(exe: str, storage: Path, timeout: float = 120) -> str:
+    """External key tool, same protocol as WeFlow's keyProviderPath: one JSON request line on stdin,
+    NDJSON on stdout ({"type":"progress",...} lines, then one {"type":"result","success":..,"key":..})."""
+    req = {"action": "get_db_key", "dbPath": str(storage.parent.parent), "accountId": account_id(storage)}
+    flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    try:
+        r = subprocess.run([exe], input=json.dumps(req) + "\n", capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout, creationflags=flags)
+    except subprocess.TimeoutExpired as e:
+        raise WeChatDBError("取密钥工具超时了。") from e
+    except OSError as e:
+        raise WeChatDBError(f"取密钥工具启动失败：{e}") from e
+    for line in r.stdout.splitlines():
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and obj.get("type") == "result":
+            if obj.get("success") and obj.get("key"):
+                return str(obj["key"])
+            raise WeChatDBError(f"取密钥工具没取到：{obj.get('error') or '未知原因'}")
+    raise WeChatDBError(f"取密钥工具没有返回结果（退出码 {r.returncode}）{r.stderr[-200:]}")
+
+
 # ---------------------------------------------------------------- crypto helpers
 
 
@@ -199,7 +289,10 @@ class WeChatDB:
         "tmessage", "officialaccounts", "notification_messages", "mphelper", "@placeholder_foldgroup",
     }
 
-    def __init__(self) -> None:
+    def __init__(self, saved_key=None, extra_roots: list[Path] | None = None) -> None:
+        """saved_key(account_id) -> hex or None: keys the user saved in this app."""
+        self.saved_key = saved_key or (lambda _a: None)
+        self.extra_roots = extra_roots or []
         self._account: Account | None = None
         self._cache: dict[str, tuple[str, sqlite3.Connection]] = {}
         self._key_cache: dict[str, tuple[bytes, bytes, bytes]] = {}
@@ -210,6 +303,41 @@ class WeChatDB:
     def account(self) -> Account:
         if self._account:
             return self._account
+        try:
+            self._account = self._from_weflow()
+            return self._account
+        except WeChatDBError as e:
+            weflow_error = e
+        storages = find_storages(self.extra_roots)
+        if not storages:
+            raise WeChatDBError("没找到微信数据目录（xwechat_files）。微信 4.x 登录过吗？或在「密钥」里指定数据目录。")
+        for st in storages:
+            raw = parse_hex_key(self.saved_key(account_id(st)) or "")
+            derive = check_key(st, raw) if raw else None
+            if derive is not None:
+                self._account = Account(st, normalize_wxid(account_id(st)), raw, derive)
+                return self._account
+        hint = "（WeFlow 里存的密钥也对不上）" if "对不上" in str(weflow_error) else ""
+        raise NeedKey(f"找到了微信数据，但还没有数据库密钥{hint}：点「密钥」粘贴，或指定取密钥工具。")
+
+    def use_key(self, hexkey: str, storage: Path | None = None) -> Account:
+        """Checks `hexkey` against this computer's WeChat accounts and switches to the one it opens."""
+        raw = parse_hex_key(hexkey)
+        if len(raw) != 32:
+            raise WeChatDBError("密钥应该是 64 位十六进制字符。")
+        for st in [storage] if storage else find_storages(self.extra_roots):
+            derive = check_key(st, raw)
+            if derive is not None:
+                with self.lock:
+                    for _, conn in self._cache.values():
+                        conn.close()
+                    self._cache.clear()
+                    self._key_cache.clear()
+                    self._account = Account(st, normalize_wxid(account_id(st)), raw, derive)
+                return self._account
+        raise WeChatDBError("这个密钥打不开本机任何一个微信账号的数据库。")
+
+    def _from_weflow(self) -> Account:
         wdir = _weflow_dir()
         try:
             cfg = json.loads((wdir / "WeFlow-config.json").read_text(encoding="utf-8"))

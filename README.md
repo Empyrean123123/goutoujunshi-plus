@@ -16,9 +16,17 @@
 
 读不到本地记录时，自动改用截图模式：截取微信窗口发给 Claude。
 
+## 用 AI 一键部署
+
+装好 Claude Code 或 Codex 后，对它说：
+
+> 把 https://github.com/Empyrean123123/goutoujunshi-plus 克隆到本地，按仓库里 AGENTS.md 的说明帮我部署好并启动。
+
+AI 会自动安装 Python 依赖、找到微信数据目录、检查能不能读取聊天记录、配置引擎并启动面板。唯一可能需要你出手的是**微信数据库密钥**：这台电脑上用 WeFlow 取过密钥的话会自动用上；否则需要你提供取密钥工具或密钥本身（见 AGENTS.md 第 4 步）。没有密钥也能用截图模式。
+
 ## Windows
 
-需要先装好 WeFlow，并在里面取到当前微信账号的密钥。
+读取本地聊天记录需要微信数据库密钥。来源可以是：WeFlow 之前存下的密钥（自动使用）；面板上点「密钥」粘贴的密钥；或者在同一处指定一个外部取密钥工具（与 WeFlow「外部密钥工具」同一种协议）。没有密钥时会自动改用截图模式。
 
 **直接用**：在本仓库的 Actions → windows → 最新一次运行 → Artifacts 里下载 `WeChatCoach-windows`，解压得到 `WeChatCoach.exe`。
 
