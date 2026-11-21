@@ -28,7 +28,7 @@ def build(out: Path) -> None:
     out.mkdir(parents=True, exist_ok=True)
     for name, src in FILES:
         shutil.copyfile(src, out / name)
-    print(f"prompt → {out} ({sum((out / n).stat().st_size for n, _ in FILES)} bytes)")
+    print(f"prompt -> {out} ({sum((out / n).stat().st_size for n, _ in FILES)} bytes)")
 
 
 def join(texts: list[str]) -> str:

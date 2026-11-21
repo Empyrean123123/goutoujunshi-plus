@@ -895,6 +895,9 @@ if __name__ == "__main__":
             ctypes.windll.shcore.SetProcessDpiAwareness(2)
         except Exception:
             pass
+    for stream in (sys.stdout, sys.stderr):  # consoles on Windows may not be UTF-8
+        if stream is not None and hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
     if len(sys.argv) >= 2 and sys.argv[1] == "--source-check":
         sys.exit(source_check())
     app = Coach()
