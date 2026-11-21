@@ -7,7 +7,11 @@
 ## 工作原理
 
 1. 微信 4.x 的聊天数据库是加密的。这里用 [WeFlow](https://github.com/hicccc77/WeFlow) 之前取到的数据库密钥，在**内存里**解密，只读，不往磁盘写，也不改微信的数据。
-2. 把最近 N 条消息（默认 150）整理成文字记录，连同「狗头军师」知识库（`goutoujunshi/`）一起发给 Claude。
+2. 把最近 N 条消息（默认 150）整理成文字记录，连同「狗头军师」知识库（`goutoujunshi/`）一起发给 AI。面板上可以选引擎：
+   - **Claude API Key**：在面板里点「Key」填写
+   - **Claude Code**：用已登录的 `claude` 命令行（订阅额度）
+   - **Codex**：用已登录的 `codex` 命令行（ChatGPT 额度；先 `npm i -g @openai/codex`，再 `codex login`）。Codex 要整段回答生成完才显示
+   - **自动**：有 Key 就用 Key，否则用 Claude Code，再否则用 Codex
 3. 回复里 `▶ 标签｜内容` 这样的行会变成按钮，点了就复制并切回微信。
 
 读不到本地记录时，自动改用截图模式：截取微信窗口发给 Claude。
@@ -32,8 +36,8 @@ python coach.py
 
 - 快捷键 **Ctrl+Alt+G** 呼出面板。关掉窗口后程序仍在后台运行。
 - 默认选中最近聊过的人，也可以在下拉框里换别人。
-- API Key 保存在 Windows 凭据管理器里；不填 Key 时，使用已登录的 `claude` 命令行（Claude Code 订阅）。
-- 设置和每个人的背景备注保存在 `%APPDATA%\WeChatCoach\settings.json`，可改 `history`（条数）和 `effort`（low / medium / high）。
+- API Key 保存在 Windows 凭据管理器里。
+- 设置和每个人的背景备注保存在 `%APPDATA%\WeChatCoach\settings.json`，可改 `history`（条数）、`effort`（low / medium / high）和 `engine`（auto / api / claude / codex）。
 
 ## macOS
 

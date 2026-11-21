@@ -33,6 +33,12 @@ from wechat_db import Session, WeChatDB, WeChatDBError
 IS_WIN = sys.platform == "win32"
 MODEL = "claude-opus-5-5"
 HOTKEY_LABEL = "Ctrl+Alt+G"
+ENGINES = {  # setting value → label in the panel
+    "auto": "引擎：自动",
+    "api": "Claude API Key",
+    "claude": "Claude Code",
+    "codex": "Codex",
+}
 WECHAT_EXES = {"weixin.exe", "wechat.exe", "wechatapp.exe"}
 
 
@@ -76,6 +82,11 @@ class Settings:
     def effort(self) -> str:
         e = self.data.get("effort")
         return e if e in ("low", "medium", "high") else "medium"
+
+    @property
+    def engine(self) -> str:
+        e = self.data.get("engine")
+        return e if e in ENGINES else "auto"
 
     def note(self, key: str) -> str:
         return self.data.get("notes", {}).get(key, "")
@@ -351,6 +362,80 @@ class CLIConversation:
             self.proc.terminate()
 
 
+class CodexConversation:
+    """OpenAI Codex CLI (`codex exec`, uses the logged-in ChatGPT plan). One process per turn; follow-ups
+    resume the same Codex thread. Codex prints whole messages, so the reply appears when it is done."""
+
+    def __init__(self, system: str, effort: str) -> None:
+        self.exe = shutil.which("codex")
+        if not self.exe:
+            raise CoachError("没找到 codex 命令行。先装好 Codex（npm i -g @openai/codex）并运行 codex login。")
+        self.work = Path(tempfile.gettempdir()) / "wechat-coach-codex"  # empty dir: no AGENTS.md gets loaded
+        self.work.mkdir(exist_ok=True)
+        sys_file = self.work / "system.md"
+        sys_file.write_text(system, encoding="utf-8")
+        self.config = [
+            "-c", f'model_instructions_file="{sys_file.as_posix()}"',
+            "-c", f'model_reasoning_effort="{effort}"',
+            "-c", 'sandbox_mode="read-only"',
+            "-c", 'approval_policy="never"',
+        ]
+        self.thread_id: str | None = None
+        self.proc: subprocess.Popen | None = None
+
+    alive = True
+
+    def send(self, content: list[dict], on_text) -> str:
+        text = "\n\n".join(b["text"] for b in content if b.get("type") == "text")
+        images = []
+        for i, b in enumerate(b for b in content if b.get("type") == "image"):
+            img = self.work / f"shot{i}.jpg"
+            img.write_bytes(base64.b64decode(b["source"]["data"]))
+            images += ["-i", str(img)]
+        if self.thread_id:
+            cmd = [self.exe, "exec", "resume", self.thread_id]
+        else:
+            cmd = [self.exe, "exec"]
+        cmd += ["--json", "--skip-git-repo-check", *self.config, *images, "-"]
+        flags = subprocess.CREATE_NO_WINDOW if IS_WIN else 0
+        self.proc = subprocess.Popen(cmd, cwd=self.work, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+                                     creationflags=flags)
+        self.proc.stdin.write(text)  # via stdin: Windows caps command lines at ~32k characters
+        self.proc.stdin.close()
+        stderr: list[str] = []
+        threading.Thread(target=lambda: stderr.extend(self.proc.stderr), daemon=True).start()
+        replies: list[str] = []
+        failure = ""
+        for line in self.proc.stdout:
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            kind = ev.get("type")
+            if kind == "thread.started":
+                self.thread_id = ev.get("thread_id") or self.thread_id
+            elif kind == "item.completed" and (ev.get("item") or {}).get("type") == "agent_message":
+                msg = ev["item"].get("text", "")
+                on_text(("\n\n" if replies else "") + msg)
+                replies.append(msg)
+            elif kind == "turn.failed":
+                failure = ((ev.get("error") or {}).get("message")) or "Codex 这一轮失败了"
+            elif kind == "error":
+                failure = ev.get("message") or failure
+        code = self.proc.wait()
+        if replies:
+            return "\n\n".join(replies)
+        detail = failure or "".join(stderr)[-300:] or f"退出码 {code}"
+        if "401" in detail or "auth" in detail.lower() or "login" in detail.lower():
+            raise CoachError("Codex 还没登录：在终端运行 codex login。")
+        raise CoachError(f"Codex 出错：{detail[:300]}")
+
+    def close(self) -> None:
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+
+
 # ---------------------------------------------------------------- reply parsing ("▶ 稳｜text")
 
 
@@ -468,6 +553,10 @@ class Coach:
         self.auto = tk.BooleanVar(value=bool(self.settings.data.get("auto")))
         ttk.Checkbutton(act, text="她回了自动分析", variable=self.auto, command=self.toggle_auto).pack(side="left", padx=8)
         ttk.Button(act, text="Key", command=self.ask_key).pack(side="right")
+        self.engine_box = ttk.Combobox(act, state="readonly", width=14, values=list(ENGINES.values()))
+        self.engine_box.current(list(ENGINES).index(self.settings.engine))
+        self.engine_box.bind("<<ComboboxSelected>>", lambda e: self.engine_changed())
+        self.engine_box.pack(side="right", padx=6)
 
         self.status = ttk.Label(f, text=f"{HOTKEY_LABEL} 呼出面板，选好聊天后点「分析」", foreground="gray",
                                 wraplength=400)
@@ -603,7 +692,7 @@ class Coach:
             self.bg(self.refresh_sessions)
 
     def ask_key(self) -> None:
-        key = simpledialog.askstring("Anthropic API Key", "可选，不填就用 claude 命令行。\n保存在 Windows 凭据管理器里，只发给 api.anthropic.com。",
+        key = simpledialog.askstring("Anthropic API Key", "可选，不填就用 claude / codex 命令行。\n保存在 Windows 凭据管理器里，只发给 api.anthropic.com。",
                                      show="*", parent=self.root)
         if key and key.strip():
             try:
@@ -672,17 +761,42 @@ class Coach:
 
     # -- analysis
 
+    def resolved_engine(self) -> str:
+        """auto: API Key if saved, else Claude Code, else Codex."""
+        e = self.settings.engine
+        if e != "auto":
+            return e
+        if KeyStore.load():
+            return "api"
+        if shutil.which("claude"):
+            return "claude"
+        return "codex" if shutil.which("codex") else "claude"
+
+    def engine_changed(self) -> None:
+        self.settings.data["engine"] = list(ENGINES)[self.engine_box.current()]
+        self.settings.save()
+        if self.spare and self.resolved_engine() != "claude":
+            self.spare.close()
+            self.spare = None
+        self.prewarm()
+        self.set_status(f"已切换到 {ENGINES[self.settings.engine]}，下次分析生效")
+
     def take_conversation(self):
-        key = KeyStore.load()
-        if key:
+        engine = self.resolved_engine()
+        if engine == "api":
+            key = KeyStore.load()
+            if not key:
+                raise CoachError("还没设置 API Key：点「Key」填一个，或把引擎换成 Claude Code / Codex。")
             return APIConversation(key, self.system_prompt, self.settings.effort)
+        if engine == "codex":
+            return CodexConversation(self.system_prompt, self.settings.effort)
         convo = self.spare if self.spare and self.spare.alive else CLIConversation(self.system_prompt, self.settings.effort)
         self.spare = None
         self.root.after(1000, self.prewarm)
         return convo
 
     def prewarm(self) -> None:
-        if KeyStore.load() or (self.spare and self.spare.alive) or not shutil.which("claude"):
+        if self.resolved_engine() != "claude" or (self.spare and self.spare.alive) or not shutil.which("claude"):
             return
         try:
             self.spare = CLIConversation(self.system_prompt, self.settings.effort)
@@ -848,8 +962,8 @@ class Coach:
     # -- run
 
     def run(self) -> None:
-        if not KeyStore.load() and not shutil.which("claude"):
-            self.set_status("没找到 claude 命令行，也没有 API Key：点「Key」填一个，或装好 Claude Code 并登录")
+        if not KeyStore.load() and not shutil.which("claude") and not shutil.which("codex"):
+            self.set_status("没有 API Key，也没找到 claude / codex 命令行：点「Key」填一个，或装好 Claude Code / Codex 并登录")
         register_hotkey(lambda: self.on_ui(self.summon))
         self.prewarm()
         self.bg(self.refresh_sessions)

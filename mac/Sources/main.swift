@@ -53,6 +53,35 @@ enum Settings {
     }
 }
 
+// MARK: - Engine (defaults write local.wechatcoach engine auto|api|claude|codex)
+
+enum Engine: String, CaseIterable {
+    case auto, api, claude, codex
+
+    var label: String {
+        switch self {
+        case .auto: return "引擎：自动"
+        case .api: return "Claude API Key"
+        case .claude: return "Claude Code"
+        case .codex: return "Codex"
+        }
+    }
+
+    static var selected: Engine {
+        get { Engine(rawValue: UserDefaults.standard.string(forKey: "engine") ?? "") ?? .auto }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: "engine") }
+    }
+
+    /// auto: API Key if saved, else Claude Code, else Codex.
+    static var resolved: Engine {
+        let e = selected
+        guard e == .auto else { return e }
+        if KeyStore.load() != nil { return .api }
+        if ClaudeCLI.executable() != nil { return .claude }
+        return CodexCLI.executable() != nil ? .codex : .claude
+    }
+}
+
 // MARK: - API key storage (env var first, then Keychain)
 
 enum KeyStore {
@@ -500,6 +529,122 @@ final class CLIConversation: CoachConversation {
     }
 }
 
+// MARK: - OpenAI Codex CLI backend (`codex exec`, uses the logged-in ChatGPT plan)
+
+enum CodexCLI {
+    static func executable() -> String? {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let candidates = ["/opt/homebrew/bin/codex", "/usr/local/bin/codex", "\(home)/.local/bin/codex",
+                          "\(home)/.npm-global/bin/codex", "\(home)/.bun/bin/codex"]
+        if let hit = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) { return hit }
+        // GUI apps don't get the shell PATH (nvm, volta, …): ask a login shell once.
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        p.arguments = ["-lc", "command -v codex"]
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return nil }
+        p.waitUntilExit()
+        let path = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return FileManager.default.isExecutableFile(atPath: path) ? path : nil
+    }
+}
+
+/// One `codex exec` process per turn; follow-ups resume the same Codex thread.
+/// Codex prints whole messages, so each reply appears when it is finished.
+@MainActor
+final class CodexConversation: CoachConversation {
+    private let exe: String
+    private let workDir: URL
+    private let config: [String]
+    private var threadId: String?
+    private var proc: Process?
+
+    init(system: String) throws {
+        guard let exe = CodexCLI.executable() else {
+            throw CoachError.api("没找到 codex 命令行。先装好 Codex（npm i -g @openai/codex）并运行 codex login。")
+        }
+        self.exe = exe
+        // Empty temp dir so no project AGENTS.md gets loaded.
+        workDir = FileManager.default.temporaryDirectory.appendingPathComponent("wechat-coach-codex")
+        try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+        let sysFile = workDir.appendingPathComponent("system.md")
+        try system.write(to: sysFile, atomically: true, encoding: .utf8)
+        config = ["-c", "model_instructions_file=\"\(sysFile.path)\"",
+                  "-c", "model_reasoning_effort=\"\(Settings.effort)\"",
+                  "-c", "sandbox_mode=\"read-only\"", "-c", "approval_policy=\"never\""]
+    }
+
+    func send(_ content: [[String: Any]], onText: @escaping @MainActor (String) -> Void) async throws {
+        let text = content.compactMap { $0["type"] as? String == "text" ? $0["text"] as? String : nil }
+            .joined(separator: "\n\n")
+        var images: [String] = []
+        for (i, block) in content.filter({ $0["type"] as? String == "image" }).enumerated() {
+            guard let src = block["source"] as? [String: Any], let b64 = src["data"] as? String,
+                  let data = Data(base64Encoded: b64) else { continue }
+            let url = workDir.appendingPathComponent("shot\(i).jpg")
+            try data.write(to: url)
+            images += ["-i", url.path]
+        }
+        var args = threadId.map { ["exec", "resume", $0] } ?? ["exec"]
+        args += ["--json", "--skip-git-repo-check"] + config + images + ["-"]
+
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: exe)
+        p.arguments = args
+        p.currentDirectoryURL = workDir
+        var env = ProcessInfo.processInfo.environment  // npm's codex is a node script: node must be on PATH
+        let dir = URL(fileURLWithPath: exe).resolvingSymlinksInPath().deletingLastPathComponent().path
+        env["PATH"] = [URL(fileURLWithPath: exe).deletingLastPathComponent().path, dir,
+                       "/opt/homebrew/bin", "/usr/local/bin", env["PATH"] ?? "/usr/bin:/bin"].joined(separator: ":")
+        p.environment = env
+        let inPipe = Pipe(), outPipe = Pipe(), errPipe = Pipe()
+        p.standardInput = inPipe
+        p.standardOutput = outPipe
+        p.standardError = errPipe
+        try p.run()
+        proc = p
+        inPipe.fileHandleForWriting.write(Data(text.utf8))
+        try? inPipe.fileHandleForWriting.close()
+
+        var replies: [String] = []
+        var failure = ""
+        for try await line in outPipe.fileHandleForReading.bytes.lines {
+            guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                  let type = obj["type"] as? String else { continue }
+            switch type {
+            case "thread.started":
+                threadId = (obj["thread_id"] as? String) ?? threadId
+            case "item.completed":
+                if let item = obj["item"] as? [String: Any], item["type"] as? String == "agent_message",
+                   let msg = item["text"] as? String {
+                    onText((replies.isEmpty ? "" : "\n\n") + msg)
+                    replies.append(msg)
+                }
+            case "turn.failed":
+                failure = ((obj["error"] as? [String: Any])?["message"] as? String) ?? "Codex 这一轮失败了"
+            case "error":
+                failure = (obj["message"] as? String) ?? failure
+            default: break
+            }
+        }
+        p.waitUntilExit()
+        if !replies.isEmpty { return }
+        let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let detail = failure.isEmpty ? String(err.suffix(300)) : failure
+        if detail.contains("401") || detail.lowercased().contains("login") || detail.lowercased().contains("auth") {
+            throw CoachError.api("Codex 还没登录：在终端运行 codex login。")
+        }
+        throw CoachError.api("Codex 出错：\(detail.prefix(300))")
+    }
+
+    func close() {
+        if proc?.isRunning == true { proc?.terminate() }
+    }
+}
+
 // MARK: - Reply parsing ("▶ 稳｜text" lines become copy buttons)
 
 struct Reply: Equatable {
@@ -543,6 +688,7 @@ final class Coach: NSObject, NSWindowDelegate, NSApplicationDelegate {
     private let repliesStack = NSStackView()
     private let output = NSTextView()
     private let askField = NSTextField()
+    private let engineMenu = NSPopUpButton()
     private var statusItem: NSStatusItem!
 
     private let systemPrompt = Claude.loadSystemPrompt()
@@ -569,8 +715,8 @@ final class Coach: NSObject, NSWindowDelegate, NSApplicationDelegate {
         buildStatusItem()
         registerHotKey()
         panel.orderFrontRegardless()
-        if KeyStore.load() == nil && ClaudeCLI.executable() == nil {
-            setStatus("没找到 claude 命令行，也没有 API Key：二选一配置好再用")
+        if KeyStore.load() == nil && ClaudeCLI.executable() == nil && CodexCLI.executable() == nil {
+            setStatus("没有 API Key，也没找到 claude / codex 命令行：配置好其中一个再用")
         }
         prewarm()
         Task { await refreshSessions(detect: true) }
@@ -624,7 +770,13 @@ final class Coach: NSObject, NSWindowDelegate, NSApplicationDelegate {
         autoBox.action = #selector(toggleAuto)
         autoBox.toolTip = "对方发来新消息并停顿几秒后自动分析（需要 WeFlow；每次分析都会消耗额度）"
         let keyBtn = NSButton(title: "Key", target: self, action: #selector(askKey))
-        let actions = NSStackView(views: [analyzeBtn, autoBox, NSView(), keyBtn])
+        engineMenu.addItems(withTitles: Engine.allCases.map(\.label))
+        engineMenu.selectItem(at: Engine.allCases.firstIndex(of: Engine.selected) ?? 0)
+        engineMenu.target = self
+        engineMenu.action = #selector(engineChanged)
+        engineMenu.controlSize = .small
+        engineMenu.toolTip = "自动：有 API Key 用 Key，否则用 Claude Code，再否则用 Codex"
+        let actions = NSStackView(views: [analyzeBtn, autoBox, NSView(), engineMenu, keyBtn])
         actions.spacing = 8
 
         status.lineBreakMode = .byTruncatingTail
@@ -790,9 +942,16 @@ final class Coach: NSObject, NSWindowDelegate, NSApplicationDelegate {
         Settings.setNote(noteField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), for: noteKey)
     }
 
+    @objc private func engineChanged() {
+        Engine.selected = Engine.allCases[max(engineMenu.indexOfSelectedItem, 0)]
+        if Engine.resolved != .claude { spare?.close(); spare = nil }
+        prewarm()
+        setStatus("已切换到 \(Engine.selected.label)，下次分析生效")
+    }
+
     @objc private func askKey() {
         let alert = NSAlert()
-        alert.messageText = "Anthropic API Key（可选，不填就用 claude 命令行）"
+        alert.messageText = "Anthropic API Key（可选，不填就用 claude / codex 命令行）"
         alert.informativeText = "保存在本机钥匙串（Keychain）里，只发给 api.anthropic.com。"
         let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
         alert.accessoryView = field
@@ -905,7 +1064,17 @@ final class Coach: NSObject, NSWindowDelegate, NSApplicationDelegate {
 
     /// Uses the pre-started CLI process when there is one, then starts the next spare in the background.
     private func takeConversation() throws -> CoachConversation {
-        if let key = KeyStore.load() { return APIConversation(key: key, system: systemPrompt) }
+        switch Engine.resolved {
+        case .api:
+            guard let key = KeyStore.load() else {
+                throw CoachError.api("还没设置 API Key：点「Key」填一个，或把引擎换成 Claude Code / Codex。")
+            }
+            return APIConversation(key: key, system: systemPrompt)
+        case .codex:
+            return try CodexConversation(system: systemPrompt)
+        case .auto, .claude:
+            break
+        }
         let convo: CLIConversation
         if let s = spare, s.isAlive { convo = s } else { convo = try CLIConversation(system: systemPrompt) }
         spare = nil
@@ -914,7 +1083,7 @@ final class Coach: NSObject, NSWindowDelegate, NSApplicationDelegate {
     }
 
     private func prewarm() {
-        guard KeyStore.load() == nil, spare?.isAlive != true else { return }
+        guard Engine.resolved == .claude, spare?.isAlive != true else { return }
         spare = try? CLIConversation(system: systemPrompt)
     }
 
