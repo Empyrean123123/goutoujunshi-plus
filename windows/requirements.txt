@@ -1,0 +1,5 @@
+anthropic>=2.12
+cryptography>=44
+zstandard>=0.23
+keyring>=25
+pillow>=11
